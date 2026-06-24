@@ -1,0 +1,405 @@
+// <copyright file="StashValueCore.cs" company="zx0CF1">
+// Copyright (c) zx0CF1. All rights reserved.
+// </copyright>
+
+namespace StashValue
+{
+    // Adapted and inspired by LootValue (GameHelper2 upstream) and RitualHelper (by caio).
+    using System;
+    using System.Collections.Generic;
+    using System.Globalization;
+    using System.IO;
+    using System.Linq;
+    using System.Numerics;
+    using System.Reflection;
+    using System.Text.RegularExpressions;
+    using GameHelper;
+    using GameHelper.Plugin;
+    using GameHelper.RemoteEnums;
+    using GameHelper.RemoteObjects.Components;
+    using GameHelper.RemoteObjects.States.InGameStateObjects;
+    using GameOffsets.Natives;
+    using GameOffsets.Objects.UiElement;
+    using ImGuiNET;
+    using Newtonsoft.Json;
+
+    /// <summary>
+    ///     StashValue plugin — prices items inside the player's stash when opened
+    ///     and overlays their values directly on the stash item slots.
+    /// </summary>
+    public sealed class StashValueCore : PCore<StashValueSettings>
+    {
+        private object? handleObj;
+        private object? uiParentsObj;
+        private MethodInfo? readUiOffsetMethod;
+        private MethodInfo? readStdVectorMethod;
+        private MethodInfo? readIntPtrMethod;
+
+        private Inventory? stashInventory;
+
+        private string SettingPathname => Path.Join(this.DllDirectory, "config", "settings.txt");
+
+        /// <inheritdoc/>
+        public override void OnEnable(bool isGameOpened)
+        {
+            if (File.Exists(this.SettingPathname))
+            {
+                try
+                {
+                    this.Settings = JsonConvert.DeserializeObject<StashValueSettings>(File.ReadAllText(this.SettingPathname)) ?? new StashValueSettings();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[StashValue] Failed to load settings: {ex.Message}");
+                    this.Settings = new StashValueSettings();
+                }
+            }
+
+            PoeNinjaPriceFetcher.Configure(this.Settings.PriceSource, this.Settings.League ?? string.Empty, this.Settings.RefreshIntervalMin);
+            PoeNinjaPriceFetcher.Initialize(this.DllDirectory);
+        }
+
+        /// <inheritdoc/>
+        public override void OnDisable()
+        {
+            this.handleObj = null;
+            this.uiParentsObj = null;
+            this.readUiOffsetMethod = null;
+            this.readStdVectorMethod = null;
+            this.readIntPtrMethod = null;
+            this.stashInventory = null;
+        }
+
+        /// <inheritdoc/>
+        public override void SaveSettings()
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(this.SettingPathname) ?? string.Empty);
+                File.WriteAllText(this.SettingPathname, JsonConvert.SerializeObject(this.Settings, Formatting.Indented));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[StashValue] Failed to save settings: {ex.Message}");
+            }
+        }
+
+        /// <inheritdoc/>
+        public override void DrawSettings()
+        {
+            var changed = false;
+            changed |= ImGui.Checkbox("Show stash item prices", ref this.Settings.ShowOverlay);
+            changed |= ImGui.Checkbox("Show inventory item prices", ref this.Settings.ShowInventoryOverlay);
+            changed |= ImGui.Checkbox("Show Debug Info (Draw Boxes & Diagnostics)", ref this.Settings.ShowDebugInfo);
+
+            ImGui.Separator();
+            ImGui.Text("Display Currency");
+            if (ImGui.RadioButton("Chaos", this.Settings.DisplayCurrency == 2)) { this.Settings.DisplayCurrency = 2; changed = true; }
+            ImGui.SameLine();
+            if (ImGui.RadioButton("Exalted", this.Settings.DisplayCurrency == 1)) { this.Settings.DisplayCurrency = 1; changed = true; }
+            ImGui.SameLine();
+            if (ImGui.RadioButton("Divine", this.Settings.DisplayCurrency == 0)) { this.Settings.DisplayCurrency = 0; changed = true; }
+
+            changed |= ImGui.SliderFloat("Font Scale", ref this.Settings.PriceFontScale, 0.5f, 2f, "%.2f");
+            changed |= ImGui.SliderFloat("Horizontal Offset", ref this.Settings.PriceOffsetX, -50f, 50f);
+            changed |= ImGui.SliderFloat("Vertical Offset", ref this.Settings.PriceOffsetY, -50f, 50f);
+            changed |= ImGui.ColorEdit4("Text Color", ref this.Settings.TextColor);
+
+            ImGui.Separator();
+            ImGui.Text("Price Source");
+            if (ImGui.RadioButton("poe2scout", this.Settings.PriceSource == PoeNinjaPriceFetcher.SourcePoe2Scout))
+            {
+                this.Settings.PriceSource = PoeNinjaPriceFetcher.SourcePoe2Scout;
+                changed = true;
+            }
+            ImGui.SameLine();
+            if (ImGui.RadioButton("poe.ninja", this.Settings.PriceSource == PoeNinjaPriceFetcher.SourcePoeNinja))
+            {
+                this.Settings.PriceSource = PoeNinjaPriceFetcher.SourcePoeNinja;
+                changed = true;
+            }
+
+            changed |= ImGui.InputText("League", ref this.Settings.League, 64);
+            changed |= ImGui.SliderInt("Refresh interval (min)", ref this.Settings.RefreshIntervalMin, 1, 120);
+
+            if (changed)
+            {
+                this.SaveSettings();
+            }
+
+            if (ImGui.Button("Refresh prices now"))
+            {
+                PoeNinjaPriceFetcher.Configure(this.Settings.PriceSource, this.Settings.League ?? string.Empty, this.Settings.RefreshIntervalMin);
+                PoeNinjaPriceFetcher.ForceRefresh(this.DllDirectory, ignoreCooldown: true);
+            }
+
+            ImGui.SameLine();
+            if (PoeNinjaPriceFetcher.IsFetching)
+            {
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.2f, 1f), "Loading...");
+            }
+            else if (PoeNinjaPriceFetcher.LastFetchUtc > DateTime.MinValue)
+            {
+                var mins = Math.Max(0, (int)(DateTime.UtcNow - PoeNinjaPriceFetcher.LastFetchUtc).TotalMinutes);
+                ImGui.TextColored(new Vector4(0.5f, 0.8f, 0.5f, 1f), $"{PoeNinjaPriceFetcher.LoadedItemCount} items | {mins} min ago");
+            }
+        }
+
+        private void DrawDebugWindow()
+        {
+            ImGui.Begin("StashValue Debugger");
+            var gameUi = Core.States.InGameStateObject.GameUi;
+            if (gameUi != null)
+            {
+                ImGui.Text($"LeftPanel: {gameUi.LeftPanel.Address.ToString("X")} | Visible: {gameUi.LeftPanel.IsVisible}");
+                ImGui.Text($"RightPanel: {gameUi.RightPanel.Address.ToString("X")} | Visible: {gameUi.RightPanel.IsVisible}");
+            }
+            else
+            {
+                ImGui.Text("GameUi is NULL");
+            }
+
+            var serverData = Core.States.InGameStateObject.CurrentAreaInstance.ServerDataObject;
+            if (serverData != null)
+            {
+                var propInfo = typeof(ServerData).GetProperty("PlayerInventories", BindingFlags.Instance | BindingFlags.NonPublic);
+                var playerInventories = propInfo?.GetValue(serverData) as Dictionary<InventoryName, IntPtr>;
+                ImGui.Text($"PlayerInventories: {(playerInventories != null ? "Found" : "Not Found")}");
+                if (playerInventories != null)
+                {
+                    foreach (var kvp in playerInventories)
+                    {
+                        ImGui.Text($"Inv {kvp.Key} ({(int)kvp.Key}): {kvp.Value.ToString("X")}");
+                    }
+                    if (this.stashInventory != null)
+                    {
+                        ImGui.Text($"Stash Inventory Address: {this.stashInventory.Address.ToString("X")}");
+                        ImGui.Text($"Stash Inventory Items: {this.stashInventory.Items.Count}");
+                    }
+                }
+            }
+            else
+            {
+                ImGui.Text("ServerData is NULL");
+            }
+            ImGui.End();
+        }
+
+        /// <inheritdoc/>
+        public override void DrawUI()
+        {
+            if (Core.States.GameCurrentState != GameStateTypes.InGameState) return;
+
+            PoeNinjaPriceFetcher.Configure(this.Settings.PriceSource, this.Settings.League ?? string.Empty, this.Settings.RefreshIntervalMin);
+            PoeNinjaPriceFetcher.RefreshIfNeeded();
+
+            if (this.Settings.ShowDebugInfo)
+            {
+                this.DrawDebugWindow();
+            }
+
+            if (!this.Settings.ShowOverlay) return;
+
+            var gameUi = Core.States.InGameStateObject.GameUi;
+            if (gameUi == null || gameUi.Address == IntPtr.Zero)
+            {
+                return;
+            }
+
+            if (!this.EnsureReflection()) return;
+
+            if (gameUi.LeftPanel.IsVisible)
+            {
+                this.ScanAndDrawPrices(gameUi.LeftPanel.Address, drawDebugBoxes: this.Settings.ShowDebugInfo, drawPrices: this.Settings.ShowOverlay);
+            }
+
+            if (gameUi.RightPanel.IsVisible && (this.Settings.ShowInventoryOverlay || this.Settings.ShowDebugInfo))
+            {
+                this.ScanAndDrawPrices(gameUi.RightPanel.Address, drawDebugBoxes: this.Settings.ShowDebugInfo, drawPrices: this.Settings.ShowInventoryOverlay);
+            }
+        }
+
+        private bool EnsureReflection()
+        {
+            if (this.handleObj != null) return true;
+            var handleProp = typeof(GameProcess).GetProperty("Handle", BindingFlags.Instance | BindingFlags.NonPublic);
+            this.handleObj = handleProp?.GetValue(Core.Process);
+            if (this.handleObj == null) return false;
+
+            var methods = this.handleObj.GetType().GetMethods(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var readMem = methods.First(m => m.Name == "ReadMemory" && m.IsGenericMethod && m.GetParameters().Length == 1);
+            var readVec = methods.First(m => m.Name == "ReadStdVector" && m.IsGenericMethod);
+            this.readUiOffsetMethod = readMem.MakeGenericMethod(typeof(UiElementBaseOffset));
+            this.readStdVectorMethod = readVec.MakeGenericMethod(typeof(IntPtr));
+            this.readIntPtrMethod = readMem.MakeGenericMethod(typeof(IntPtr));
+            return true;
+        }
+
+        private void ScanAndDrawPrices(IntPtr panelAddr, bool drawDebugBoxes, bool drawPrices)
+        {
+            var queue = new Queue<IntPtr>();
+            var visited = new HashSet<IntPtr>();
+            queue.Enqueue(panelAddr);
+
+            this.uiParentsObj ??= PluginUiElementReflection.CreateParents();
+            if (this.uiParentsObj == null) return;
+
+            var fg = ImGui.GetForegroundDrawList();
+            var font = ImGui.GetFont();
+            var baseFontSize = ImGui.GetFontSize();
+            var fontSize = baseFontSize * this.Settings.PriceFontScale;
+
+            while (queue.Count > 0 && visited.Count < 5000)
+            {
+                var el = queue.Dequeue();
+                if (el == IntPtr.Zero || !visited.Add(el)) continue;
+
+                if (this.readUiOffsetMethod!.Invoke(this.handleObj, new object[] { el }) is not UiElementBaseOffset off) continue;
+                if (!UiElementBaseFuncs.IsVisibleChecker(off.Flags)) continue;
+
+                if (this.readStdVectorMethod!.Invoke(this.handleObj, new object[] { off.ChildrensPtr }) is IntPtr[] kids)
+                {
+                    foreach (var k in kids) queue.Enqueue(k);
+                }
+
+                // Check if it's an item slot UI element
+                var ptrObj = this.readIntPtrMethod!.Invoke(this.handleObj, new object[] { el + 0x4F8 });
+                var ptr = ptrObj is IntPtr intPtr ? intPtr : IntPtr.Zero;
+                if (ptr == IntPtr.Zero) continue;
+
+                if (drawDebugBoxes)
+                {
+                    try
+                    {
+                        var uiElement = PluginUiElementReflection.CreateUiElement(el, this.uiParentsObj);
+                        if (uiElement != null)
+                        {
+                            var pos = (Vector2)PluginUiElementReflection.UiElementPositionProperty!.GetValue(uiElement)!;
+                            var size = (Vector2)PluginUiElementReflection.UiElementSizeProperty!.GetValue(uiElement)!;
+                            if (pos != Vector2.Zero && size.X > 0f)
+                            {
+                                fg.AddRect(pos, pos + size, 0xFFFF00FFu, 0f, ImDrawFlags.None, 2f);
+                                fg.AddText(font, fontSize, pos, 0xFFFFFFFFu, $"E: {ptr.ToString("X")}");
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                // Price the item
+                if (drawPrices)
+                {
+                    var item = ItemModHelper.ReadFreshItem(ptr);
+                    if (item != null && this.TryPriceItem(item, out var valueText))
+                    {
+                        try
+                        {
+                            var uiElement = PluginUiElementReflection.CreateUiElement(el, this.uiParentsObj);
+                            if (uiElement == null) continue;
+
+                            var pos = (Vector2)PluginUiElementReflection.UiElementPositionProperty!.GetValue(uiElement)!;
+                            var size = (Vector2)PluginUiElementReflection.UiElementSizeProperty!.GetValue(uiElement)!;
+                            if (pos == Vector2.Zero || size.X <= 0f) continue;
+
+                            var textWidth = ImGui.CalcTextSize(valueText).X * this.Settings.PriceFontScale;
+                            var drawPos = new Vector2(
+                                pos.X + this.Settings.PriceOffsetX,
+                                pos.Y + size.Y - fontSize + this.Settings.PriceOffsetY);
+
+                            // Draw background chip
+                            fg.AddRectFilled(
+                                drawPos - new Vector2(3f, 1f),
+                                drawPos + new Vector2(textWidth + 3f, fontSize + 1f),
+                                0xB0000000u,
+                                3f);
+
+                            // Draw shadowed text
+                            fg.AddText(font, fontSize, drawPos + new Vector2(1f, 1f), 0xCC000000u, valueText);
+                            fg.AddText(font, fontSize, drawPos, ImGui.ColorConvertFloat4ToU32(this.Settings.TextColor), valueText);
+                        }
+                        catch
+                        {
+                            // Stale/freed element
+                        }
+                    }
+                }
+            }
+        }
+
+        private bool TryPriceItem(Item item, out string valueText)
+        {
+            valueText = string.Empty;
+
+            var rarity = Rarity.Normal;
+            if (item.TryGetComponent<Mods>(out var mods)) rarity = mods.Rarity;
+
+            var baseName = item.TryGetComponent<Base>(out var baseComp) ? baseComp.BaseItemName?.Trim() ?? string.Empty : string.Empty;
+            var artBasename = item.TryGetComponent<RenderItem>(out var renderItem) ? ExtractArtBasename(renderItem.ResourcePath) : string.Empty;
+            var fullItemPath = item.Path ?? string.Empty;
+            var internalName = fullItemPath.Contains('/') ? fullItemPath[(fullItemPath.LastIndexOf('/') + 1)..] : fullItemPath;
+
+            var itemName = baseName;
+            if (rarity == Rarity.Unique && !string.IsNullOrEmpty(artBasename))
+            {
+                foreach (var key in ArtKeyVariants(artBasename))
+                {
+                    if (PoeNinjaPriceFetcher.TryResolveDisplayName(key, out var uniqueName) &&
+                        !PoeNinjaPriceFetcher.IsGenericLookupName(uniqueName))
+                    {
+                        itemName = uniqueName;
+                        break;
+                    }
+
+                    if (PoeNinjaPriceFetcher.HasPriceDataForName(key))
+                    {
+                        itemName = key;
+                        break;
+                    }
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(itemName)) return false;
+
+            var modLines = ItemModHelper.GetModLines(item);
+            var price = PoeNinjaPriceFetcher.GetPrice(itemName, modLines, internalName, fullItemPath);
+            if (price == null) return false;
+
+            var stack = item.TryGetComponent<Stack>(out var stackComp) && stackComp.Count > 1 ? stackComp.Count : 1;
+            var priceChaos = price.PriceChaos * stack;
+
+            var priced = new PoeNinjaPrice { PriceChaos = priceChaos };
+            var (displayValue, displayCurrency) = PoeNinjaPriceFetcher.GetDisplayPrice(priced, this.Settings.DisplayCurrency);
+
+            valueText = FormatValue(displayValue, displayCurrency);
+            return true;
+        }
+
+        private static string FormatValue(double value, string currency) => currency switch
+        {
+            "divine" => value.ToString("0.00", CultureInfo.InvariantCulture) + " div",
+            "chaos" => value.ToString("0.#", CultureInfo.InvariantCulture) + " c",
+            _ => value.ToString("0.#", CultureInfo.InvariantCulture) + " ex",
+        };
+
+        private static string ExtractArtBasename(string? artPath)
+        {
+            if (string.IsNullOrWhiteSpace(artPath)) return string.Empty;
+            var slash = artPath.LastIndexOfAny(new[] { '/', '\\' });
+            var file = slash >= 0 && slash < artPath.Length - 1 ? artPath[(slash + 1)..] : artPath;
+            var dot = file.LastIndexOf('.');
+            return dot > 0 ? file[..dot] : file;
+        }
+
+        private static IEnumerable<string> ArtKeyVariants(string artBasename)
+        {
+            if (string.IsNullOrWhiteSpace(artBasename)) yield break;
+            yield return artBasename;
+            if (artBasename.StartsWith("The", StringComparison.OrdinalIgnoreCase) && artBasename.Length > 3)
+                yield return artBasename[3..];
+            else
+                yield return "The" + artBasename;
+        }
+    }
+}
