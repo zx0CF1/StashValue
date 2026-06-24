@@ -19,17 +19,36 @@
 | **GameHelper** | MordWraith Fork (.NET 10.0-windows) |
 | **Tag** | `community`, `wip` |
 
-## Install
+## Install & Build
 
-1. Copy the `StashValue` plugin folder into your GameHelper `Plugins/` directory:
+### Option A: Using Pre-compiled Release (Recommended)
+1. Download `StashValue.dll` from the [Releases](https://github.com/zx0CF1/StashValue/releases) section.
+2. Create a folder named `StashValue` inside your GameHelper `Plugins/` directory.
+3. Place the downloaded `StashValue.dll` inside that folder:
    ```
    <GameHelper>\
      Plugins\
        StashValue\
          StashValue.dll
    ```
-2. Launch GameHelper.
-3. Enable **StashValue** in the plugins list.
+4. Launch GameHelper and enable **StashValue** in the plugins tab.
+
+### Option B: Build from Source
+If you prefer to compile the plugin yourself:
+1. Clone or download this repository directly into the `Plugins/` folder of your GameHelper codebase:
+   ```
+   <GameHelper>\
+     GameHelper\
+       GameHelper.csproj
+     Plugins\
+       StashValue\           ← Clone this repository here
+         StashValue.csproj
+   ```
+2. Open the main GameHelper solution (`GameOverlay.sln`) in Visual Studio, Rider, or compile via .NET CLI:
+   ```powershell
+   dotnet build -c Release
+   ```
+3. The `.csproj` is configured to automatically copy the compiled `StashValue.dll` into the local GameHelper build directory.
 
 ## Configuration & Saving
 
