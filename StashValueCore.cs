@@ -485,4 +485,31 @@ namespace StashValue
                 yield return "The" + artBasename;
         }
     }
+
+    /// <summary>
+    ///     Module initializer to dynamically resolve GameHelper vs GameHelper.App assembly references.
+    /// </summary>
+#pragma warning disable CA2255
+    public static class StashValueModuleInitializer
+    {
+        /// <summary>
+        ///     Initializes the assembly resolution redirection.
+        /// </summary>
+        [System.Runtime.CompilerServices.ModuleInitializer]
+        public static void Initialize()
+        {
+            AppDomain.CurrentDomain.AssemblyResolve += (sender, args) =>
+            {
+                var requestedName = new System.Reflection.AssemblyName(args.Name).Name;
+                if (requestedName == "GameHelper" || requestedName == "GameHelper.App")
+                {
+                    var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                    return assemblies.FirstOrDefault(a => 
+                        a.GetName().Name == "GameHelper" || a.GetName().Name == "GameHelper.App");
+                }
+                return null;
+            };
+        }
+    }
+#pragma warning restore CA2255
 }
