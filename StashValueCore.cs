@@ -90,6 +90,23 @@ namespace StashValue
             var changed = false;
             changed |= ImGui.Checkbox("Show stash item prices", ref this.Settings.ShowOverlay);
             changed |= ImGui.Checkbox("Show inventory item prices", ref this.Settings.ShowInventoryOverlay);
+            changed |= ImGui.Checkbox("Hide price when hovering item", ref this.Settings.HidePriceOnHover);
+
+            var maxThreshold = this.Settings.DisplayCurrency switch
+            {
+                0 => 100f,   // Divine
+                1 => 200f,   // Exalted
+                _ => 1000f   // Chaos
+            };
+            var currencyLabel = this.Settings.DisplayCurrency switch
+            {
+                0 => "div",
+                1 => "ex",
+                _ => "c"
+            };
+            this.Settings.MinValueEx = Math.Clamp(this.Settings.MinValueEx, 0.0f, maxThreshold);
+            changed |= ImGui.SliderFloat($"Min Price Threshold ({currencyLabel})##threshold", ref this.Settings.MinValueEx, 0.0f, maxThreshold, $"%.2f {currencyLabel}");
+
             changed |= ImGui.Checkbox("Show Debug Info (Draw Boxes & Diagnostics)", ref this.Settings.ShowDebugInfo);
 
             ImGui.Separator();
@@ -198,7 +215,10 @@ namespace StashValue
                 this.DrawDebugWindow();
             }
 
-            if (!this.Settings.ShowOverlay) return;
+            if (!this.Settings.ShowOverlay && !this.Settings.ShowInventoryOverlay && !this.Settings.ShowDebugInfo)
+            {
+                return;
+            }
 
             var gameUi = Core.States.InGameStateObject.GameUi;
             if (gameUi == null || gameUi.Address == IntPtr.Zero)
@@ -208,14 +228,32 @@ namespace StashValue
 
             if (!this.EnsureReflection()) return;
 
+            var leftSlots = new List<SlotInfo>();
+            var rightSlots = new List<SlotInfo>();
+            var leftHovered = false;
+            var rightHovered = false;
+
             if (gameUi.LeftPanel.IsVisible)
             {
-                this.ScanAndDrawPrices(gameUi.LeftPanel.Address, drawDebugBoxes: this.Settings.ShowDebugInfo, drawPrices: this.Settings.ShowOverlay);
+                leftSlots = this.ScanSlots(gameUi.LeftPanel.Address, out leftHovered);
+            }
+
+            if (gameUi.RightPanel.IsVisible)
+            {
+                rightSlots = this.ScanSlots(gameUi.RightPanel.Address, out rightHovered);
+            }
+
+            var globalAnyHovered = leftHovered || rightHovered;
+            var hideOnHoverActive = this.Settings.HidePriceOnHover && globalAnyHovered;
+
+            if (gameUi.LeftPanel.IsVisible)
+            {
+                this.DrawSlots(leftSlots, drawDebugBoxes: this.Settings.ShowDebugInfo, drawPrices: this.Settings.ShowOverlay, hideOnHoverActive: hideOnHoverActive);
             }
 
             if (gameUi.RightPanel.IsVisible && (this.Settings.ShowInventoryOverlay || this.Settings.ShowDebugInfo))
             {
-                this.ScanAndDrawPrices(gameUi.RightPanel.Address, drawDebugBoxes: this.Settings.ShowDebugInfo, drawPrices: this.Settings.ShowInventoryOverlay);
+                this.DrawSlots(rightSlots, drawDebugBoxes: this.Settings.ShowDebugInfo, drawPrices: this.Settings.ShowInventoryOverlay, hideOnHoverActive: hideOnHoverActive);
             }
         }
 
@@ -235,19 +273,29 @@ namespace StashValue
             return true;
         }
 
-        private void ScanAndDrawPrices(IntPtr panelAddr, bool drawDebugBoxes, bool drawPrices)
+        private struct SlotInfo
         {
+            public IntPtr El;
+            public IntPtr Ptr;
+            public Vector2 Pos;
+            public Vector2 Size;
+            public string ValueText;
+        }
+
+        private List<SlotInfo> ScanSlots(IntPtr panelAddr, out bool panelHovered)
+        {
+            panelHovered = false;
+            var slots = new List<SlotInfo>();
+            if (panelAddr == IntPtr.Zero) return slots;
+
             var queue = new Queue<IntPtr>();
             var visited = new HashSet<IntPtr>();
             queue.Enqueue(panelAddr);
 
             this.uiParentsObj ??= PluginUiElementReflection.CreateParents();
-            if (this.uiParentsObj == null) return;
+            if (this.uiParentsObj == null) return slots;
 
-            var fg = ImGui.GetForegroundDrawList();
-            var font = ImGui.GetFont();
-            var baseFontSize = ImGui.GetFontSize();
-            var fontSize = baseFontSize * this.Settings.PriceFontScale;
+            var mousePos = ImGui.GetIO().MousePos;
 
             while (queue.Count > 0 && visited.Count < 5000)
             {
@@ -267,46 +315,76 @@ namespace StashValue
                 var ptr = ptrObj is IntPtr intPtr ? intPtr : IntPtr.Zero;
                 if (ptr == IntPtr.Zero) continue;
 
-                if (drawDebugBoxes)
+                // Validate that it is a real item in the PoE item structure
+                var item = ItemModHelper.ReadFreshItem(ptr);
+                if (item == null || string.IsNullOrEmpty(item.Path) || !item.Path.StartsWith("Metadata/Items", StringComparison.OrdinalIgnoreCase))
                 {
-                    try
+                    continue;
+                }
+
+                try
+                {
+                    var uiElement = PluginUiElementReflection.CreateUiElement(el, this.uiParentsObj);
+                    if (uiElement != null)
                     {
-                        var uiElement = PluginUiElementReflection.CreateUiElement(el, this.uiParentsObj);
-                        if (uiElement != null)
+                        var pos = (Vector2)PluginUiElementReflection.UiElementPositionProperty!.GetValue(uiElement)!;
+                        var size = (Vector2)PluginUiElementReflection.UiElementSizeProperty!.GetValue(uiElement)!;
+                        if (pos != Vector2.Zero && size.X > 0f)
                         {
-                            var pos = (Vector2)PluginUiElementReflection.UiElementPositionProperty!.GetValue(uiElement)!;
-                            var size = (Vector2)PluginUiElementReflection.UiElementSizeProperty!.GetValue(uiElement)!;
-                            if (pos != Vector2.Zero && size.X > 0f)
+                            // Trigger hover check if mouse is on this item slot (even if below threshold, since it has a tooltip)
+                            if (mousePos.X >= pos.X && mousePos.X <= pos.X + size.X &&
+                                mousePos.Y >= pos.Y && mousePos.Y <= pos.Y + size.Y)
                             {
-                                fg.AddRect(pos, pos + size, 0xFFFF00FFu, 0f, ImDrawFlags.None, 2f);
-                                fg.AddText(font, fontSize, pos, 0xFFFFFFFFu, $"E: {ptr.ToString("X")}");
+                                panelHovered = true;
+                            }
+
+                            // Cache the display price text if it passes pricing threshold
+                            if (this.TryPriceItem(item, out var valueText))
+                            {
+                                slots.Add(new SlotInfo { El = el, Ptr = ptr, Pos = pos, Size = size, ValueText = valueText });
                             }
                         }
                     }
-                    catch
-                    {
-                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return slots;
+        }
+
+        private void DrawSlots(List<SlotInfo> slots, bool drawDebugBoxes, bool drawPrices, bool hideOnHoverActive)
+        {
+            var fg = ImGui.GetForegroundDrawList();
+            var font = ImGui.GetFont();
+            var baseFontSize = ImGui.GetFontSize();
+            var fontSize = baseFontSize * this.Settings.PriceFontScale;
+
+            foreach (var slot in slots)
+            {
+                if (drawDebugBoxes)
+                {
+                    fg.AddRect(slot.Pos, slot.Pos + slot.Size, 0xFFFF00FFu, 0f, ImDrawFlags.None, 2f);
+                    fg.AddText(font, fontSize, slot.Pos, 0xFFFFFFFFu, $"E: {slot.Ptr.ToString("X")}");
                 }
 
-                // Price the item
                 if (drawPrices)
                 {
-                    var item = ItemModHelper.ReadFreshItem(ptr);
-                    if (item != null && this.TryPriceItem(item, out var valueText))
+                    if (hideOnHoverActive)
+                    {
+                        continue;
+                    }
+
+                    var valueText = slot.ValueText;
+                    if (!string.IsNullOrEmpty(valueText))
                     {
                         try
                         {
-                            var uiElement = PluginUiElementReflection.CreateUiElement(el, this.uiParentsObj);
-                            if (uiElement == null) continue;
-
-                            var pos = (Vector2)PluginUiElementReflection.UiElementPositionProperty!.GetValue(uiElement)!;
-                            var size = (Vector2)PluginUiElementReflection.UiElementSizeProperty!.GetValue(uiElement)!;
-                            if (pos == Vector2.Zero || size.X <= 0f) continue;
-
                             var textWidth = ImGui.CalcTextSize(valueText).X * this.Settings.PriceFontScale;
                             var drawPos = new Vector2(
-                                pos.X + this.Settings.PriceOffsetX,
-                                pos.Y + size.Y - fontSize + this.Settings.PriceOffsetY);
+                                slot.Pos.X + this.Settings.PriceOffsetX,
+                                slot.Pos.Y + slot.Size.Y - fontSize + this.Settings.PriceOffsetY);
 
                             // Draw background chip
                             fg.AddRectFilled(
@@ -371,6 +449,11 @@ namespace StashValue
 
             var priced = new PoeNinjaPrice { PriceChaos = priceChaos };
             var (displayValue, displayCurrency) = PoeNinjaPriceFetcher.GetDisplayPrice(priced, this.Settings.DisplayCurrency);
+
+            if (this.Settings.MinValueEx > 0f && displayValue < this.Settings.MinValueEx)
+            {
+                return false;
+            }
 
             valueText = FormatValue(displayValue, displayCurrency);
             return true;

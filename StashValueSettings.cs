@@ -21,6 +21,12 @@ namespace StashValue
         /// <summary>Draw debug information and boxes.</summary>
         public bool ShowDebugInfo = false;
 
+        /// <summary>Minimum value (in Exalted) for an item to get a label.</summary>
+        public float MinValueEx = 0.0f;
+
+        /// <summary>Hide pricing overlays when hovering over the item slot.</summary>
+        public bool HidePriceOnHover = true;
+
         /// <summary>Price source: PoeNinja or Poe2Scout.</summary>
         public int PriceSource = 1; // Default to Poe2Scout
 

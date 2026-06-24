@@ -249,6 +249,14 @@ namespace StashValue
             }
         }
 
+        public static double GetChaosPerExalted()
+        {
+            lock (Gate)
+            {
+                return chaosPerExalted;
+            }
+        }
+
         public static (double Value, string Currency) GetDisplayPrice(PoeNinjaPrice price, int displayCurrency)
         {
             if (price == null) return (0, "divine");
