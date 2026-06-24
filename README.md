@@ -58,5 +58,5 @@ Open GameHelper → Plugins → StashValue:
 ## Credits & Upstream Attribution
 
 This plugin was developed by **zx0CF1** through collaborative AI assistance (vibe-coding / prompt engineering) with acknowledgments to:
-- **LootValue** (GameHelper2 upstream) for the overlay concept and visual reference.
+- **LootValue** (by **Gordin**, GameHelper2 upstream) for the overlay concept and visual reference.
 - **RitualHelper** (originally by **caio** / *AutoRitualPricer*) for the mod parsing and price fetcher architecture.
